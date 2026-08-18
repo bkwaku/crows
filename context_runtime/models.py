@@ -47,6 +47,7 @@ class DependencyReport:
     paths: tuple[str, ...]
     return_paths: tuple[str, ...] = ()
     branch_paths: tuple[str, ...] = ()
+    unresolved: tuple[str, ...] = ()
 
 
 @dataclass
@@ -72,4 +73,3 @@ class InvocationResult:
     def explain(self) -> dict[str, Any]:
         """Return a serializable account of selection and projection decisions."""
         return dict(self._explanation)
-

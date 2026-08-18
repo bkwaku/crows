@@ -67,10 +67,13 @@ raw_customer = artifact.raw_result
 
 Projection is evidence based. The AST analyzer follows field reads in return
 expressions, local aliases, and branch conditions that control returns. Logging
-and unrelated accesses do not enter the slice. Projection only occurs when:
+and unrelated accesses do not enter the slice. Call results only become primary
+resource roots when their return type matches the broad tool's return type.
+Projection only occurs when:
 
 - one compatible business capability matches the need unambiguously;
 - static return dependencies were found;
+- no dependency comes from an unresolved derived or opaque call result;
 - retrieval evidence clears the configured confidence threshold; and
 - every required dependency exists in the actual result.
 

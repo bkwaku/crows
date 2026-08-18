@@ -120,9 +120,15 @@ class ContextRuntime:
         if reference_match_is_ambiguous:
             dependencies = DependencyReport(paths=())
         elif reference_match is not None:
-            dependencies = self.analyzer.analyze(reference_match.capability.callable)
+            dependencies = self.analyzer.analyze(
+                reference_match.capability.callable,
+                resource_type=called_capability.return_annotation,
+            )
         else:
-            dependencies = self.analyzer.analyze(callable)
+            dependencies = self.analyzer.analyze(
+                callable,
+                resource_type=called_capability.return_annotation,
+            )
         confidence, evidence = projection_confidence(reference_match, dependencies)
 
         projected_result = raw_result
@@ -137,6 +143,12 @@ class ContextRuntime:
             confidence = 0.0
             evidence = ("AMBIGUOUS_REFERENCE_MATCH",)
             fallback_reason = "Reference capability retrieval was ambiguous"
+        elif dependencies.unresolved:
+            confidence = 0.0
+            evidence = ("UNRESOLVED_DERIVED_DEPENDENCY",)
+            fallback_reason = (
+                "Reference capability depends on a derived or opaque call result"
+            )
         elif confidence >= self.projection_threshold:
             try:
                 projected_result = project(raw_result, dependencies.paths)
@@ -174,6 +186,7 @@ class ContextRuntime:
             "confidence": round(confidence, 4),
             "threshold": self.projection_threshold,
             "dependencies": list(dependencies.paths),
+            "unresolved_dependencies": list(dependencies.unresolved),
             "evidence": list(evidence),
         }
         if fallback_reason is not None:

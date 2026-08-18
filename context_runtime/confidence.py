@@ -7,6 +7,8 @@ def projection_confidence(
     match: RetrievalMatch | None,
     dependencies: DependencyReport,
 ) -> tuple[float, tuple[str, ...]]:
+    if dependencies.unresolved:
+        return 0.0, ("UNRESOLVED_DERIVED_DEPENDENCY",)
     if match is None or not dependencies.paths:
         return 0.0, ()
 

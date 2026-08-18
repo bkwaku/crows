@@ -10,6 +10,12 @@ from typing import Any, Union, get_args, get_origin, get_type_hints
 from .models import DependencyReport
 
 
+_UNRESOLVED_ROOT = "\0unresolved:"
+_SAFE_BUILTIN_CALLS = {
+    "all", "any", "bool", "float", "int", "len", "max", "min", "str", "sum"
+}
+
+
 @dataclass(frozen=True)
 class _ClassSource:
     methods: dict[str, ast.FunctionDef | ast.AsyncFunctionDef]
@@ -22,7 +28,8 @@ class DependencyAnalyzer:
     def __init__(self, *, max_call_depth: int = 3) -> None:
         self.max_call_depth = max_call_depth
 
-    def analyze(self, function: Any) -> DependencyReport:
+    def analyze(self, function: Any, *, resource_type: Any | None = None) -> DependencyReport:
+        """Trace dependencies relative to the broad result type being projected."""
         source_context = self._class_source(function)
         function_node = self._function_node(function, source_context)
         if function_node is None:
@@ -35,14 +42,27 @@ class DependencyAnalyzer:
             source_context=source_context,
             inherited_roots=None,
             root_types=root_types,
+            resource_type=resource_type,
             depth=0,
             call_stack={function_node.name},
         )
+        unresolved = {
+            path.removeprefix(_UNRESOLVED_ROOT)
+            for path in return_paths | branch_paths
+            if path.startswith(_UNRESOLVED_ROOT)
+        }
+        return_paths = {
+            path for path in return_paths if not path.startswith(_UNRESOLVED_ROOT)
+        }
+        branch_paths = {
+            path for path in branch_paths if not path.startswith(_UNRESOLVED_ROOT)
+        }
         paths = return_paths | branch_paths
         return DependencyReport(
             paths=tuple(sorted(paths)),
             return_paths=tuple(sorted(return_paths)),
             branch_paths=tuple(sorted(branch_paths)),
+            unresolved=tuple(sorted(unresolved)),
         )
 
     def _analyze_node(
@@ -53,6 +73,7 @@ class DependencyAnalyzer:
         source_context: _ClassSource,
         inherited_roots: dict[str, str] | None,
         root_types: dict[str, Any],
+        resource_type: Any | None,
         depth: int,
         call_stack: set[str],
     ) -> tuple[set[str], set[str]]:
@@ -64,6 +85,7 @@ class DependencyAnalyzer:
                 argument.arg not in {"self", "cls"}
                 and not argument.arg.endswith("_id")
                 and argument.arg not in resource_roots
+                and self._types_match(root_types.get(argument.arg), resource_type)
             ):
                 resource_roots[argument.arg] = ""
 
@@ -75,8 +97,23 @@ class DependencyAnalyzer:
                     if isinstance(target, ast.Name):
                         assignments[target.id] = value
                         if isinstance(value, (ast.Call, ast.Await)):
-                            resource_roots.setdefault(target.id, "")
                             inferred = self._infer_call_return_type(value, function)
+                            call = value.value if isinstance(value, ast.Await) else value
+                            helper_name = (
+                                self._local_helper_name(call.func)
+                                if isinstance(call, ast.Call)
+                                else None
+                            )
+                            resource_roots.pop(target.id, None)
+                            if self._types_match(inferred, resource_type):
+                                resource_roots[target.id] = ""
+                            elif helper_name not in source_context.methods:
+                                resource_roots[target.id] = self._unresolved_call_root(
+                                    target.id,
+                                    call,
+                                    inferred,
+                                    resource_type,
+                                )
                         else:
                             inferred = self._expression_type(value, assignments, root_types)
                         if inferred is not None:
@@ -94,6 +131,7 @@ class DependencyAnalyzer:
                         root_types,
                         function,
                         source_context,
+                        resource_type,
                         depth,
                         call_stack,
                         set(),
@@ -108,6 +146,7 @@ class DependencyAnalyzer:
                         root_types,
                         function,
                         source_context,
+                        resource_type,
                         depth,
                         call_stack,
                         set(),
@@ -131,6 +170,7 @@ class DependencyAnalyzer:
         root_types: dict[str, Any],
         function: Any,
         source_context: _ClassSource,
+        resource_type: Any | None,
         depth: int,
         call_stack: set[str],
         resolving: set[str],
@@ -141,6 +181,7 @@ class DependencyAnalyzer:
             resource_roots,
             root_types,
             function,
+            resource_type,
             depth,
             call_stack,
         )
@@ -163,6 +204,7 @@ class DependencyAnalyzer:
                     root_types,
                     function,
                     source_context,
+                    resource_type,
                     depth,
                     call_stack,
                     resolving | {root},
@@ -181,6 +223,7 @@ class DependencyAnalyzer:
                 root_types,
                 function,
                 source_context,
+                resource_type,
                 depth,
                 call_stack,
                 resolving | {node.id},
@@ -194,6 +237,7 @@ class DependencyAnalyzer:
                 root_types,
                 function,
                 source_context,
+                resource_type,
                 depth,
                 call_stack,
                 resolving,
@@ -210,6 +254,7 @@ class DependencyAnalyzer:
                     root_types,
                     function,
                     source_context,
+                    resource_type,
                     depth,
                     call_stack,
                     resolving,
@@ -225,6 +270,7 @@ class DependencyAnalyzer:
         root_types: dict[str, Any],
         function: Any,
         source_context: _ClassSource,
+        resource_type: Any | None,
         depth: int,
         call_stack: set[str],
         resolving: set[str],
@@ -267,6 +313,7 @@ class DependencyAnalyzer:
                 source_context=source_context,
                 inherited_roots=inherited,
                 root_types=helper_types,
+                resource_type=resource_type,
                 depth=depth + 1,
                 call_stack=call_stack | {helper_name},
             )
@@ -284,6 +331,7 @@ class DependencyAnalyzer:
                     root_types,
                     function,
                     source_context,
+                    resource_type,
                     depth,
                     call_stack,
                     resolving,
@@ -298,8 +346,12 @@ class DependencyAnalyzer:
         # For opaque method calls, retain the receiver. This turns
         # customer.status.lower() into status and subscription.is_active() into
         # subscription rather than silently dropping the call receiver.
+        receiver_path: str | None = None
         if isinstance(node.func, ast.Attribute):
             receiver = node.func.value
+            receiver_path = self._root_path(
+                receiver, assignments, resource_roots, set()
+            )
             dependencies.update(
                 self._dependencies(
                     receiver,
@@ -308,9 +360,29 @@ class DependencyAnalyzer:
                     root_types,
                     function,
                     source_context,
+                    resource_type,
                     depth,
                     call_stack,
                     resolving,
+                )
+            )
+        inferred = self._infer_call_return_type(node, function)
+        safe_builtin = (
+            isinstance(node.func, ast.Name)
+            and node.func.id in _SAFE_BUILTIN_CALLS
+        )
+        if not (
+            mapping_path
+            or receiver_path is not None
+            or safe_builtin
+            or self._types_match(inferred, resource_type)
+        ):
+            dependencies.add(
+                self._unresolved_call_root(
+                    "inline result",
+                    node,
+                    inferred,
+                    resource_type,
                 )
             )
         return dependencies
@@ -386,6 +458,7 @@ class DependencyAnalyzer:
         resource_roots: dict[str, str],
         root_types: dict[str, Any],
         function: Any,
+        resource_type: Any | None,
         depth: int,
         call_stack: set[str],
     ) -> set[str] | None:
@@ -422,6 +495,7 @@ class DependencyAnalyzer:
             source_context=_ClassSource(methods={property_node.name: property_node}, properties={property_node.name}),
             inherited_roots={"self": prefix},
             root_types={"self": parent_type},
+            resource_type=resource_type,
             depth=depth + 1,
             call_stack=call_stack | {property_node.name},
         )
@@ -534,6 +608,35 @@ class DependencyAnalyzer:
         except (AttributeError, NameError, TypeError):
             return None
         return hints.get("return")
+
+    @staticmethod
+    def _types_match(inferred: Any | None, resource_type: Any | None) -> bool:
+        if inferred in (None, Any) or resource_type in (None, Any):
+            return False
+        return inferred == resource_type
+
+    @staticmethod
+    def _unresolved_call_root(
+        target: str,
+        call: ast.AST,
+        inferred: Any | None,
+        resource_type: Any | None,
+    ) -> str:
+        if isinstance(call, ast.Call):
+            try:
+                call_name = ast.unparse(call.func)
+            except (AttributeError, ValueError):
+                call_name = "opaque call"
+        else:
+            call_name = "opaque call"
+        inferred_name = getattr(inferred, "__name__", str(inferred or "unknown"))
+        resource_name = getattr(
+            resource_type, "__name__", str(resource_type or "unknown")
+        )
+        return (
+            f"{_UNRESOLVED_ROOT}{target} from {call_name} "
+            f"returns {inferred_name}, expected {resource_name}"
+        )
 
     @staticmethod
     def _type_at_path(root_type: Any, parts: list[str]) -> Any | None:

@@ -107,15 +107,14 @@ class NewFeatureTests(unittest.TestCase):
 
     def test_interprocedural_property_receiver_and_collection_dependencies(self) -> None:
         service = DecisionService(Repository())
-        report = DependencyAnalyzer(max_call_depth=4).analyze(service.can_renew)
+        report = DependencyAnalyzer(max_call_depth=4).analyze(
+            service.can_renew,
+            resource_type=Customer,
+        )
         self.assertEqual(
             set(report.paths),
             {"subscription.status", "orders.status"},
         )
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 @dataclass
 class Preferences:
@@ -153,3 +152,109 @@ class RegressionTests(unittest.TestCase):
         result=runtime.invoke_callable(need='Should this customer receive a renewal reminder?', callable=repo.get_customer, kwargs={'customer_id':'1'})
         self.assertTrue(result.projected, result.explain())
         self.assertEqual(set(result.dependencies), {'subscription.status','subscription.seats','permissions.account_suspended','preferences.email_opt_in','profile.email'})
+
+
+@dataclass
+class ProvenanceCustomer:
+    status: str
+    private_notes: str
+
+
+@dataclass
+class Summary:
+    status: str
+
+
+class ProvenanceRepository:
+    def get_customer(self, customer_id: str) -> ProvenanceCustomer:
+        """Return the complete provenance test customer."""
+        return ProvenanceCustomer(
+            status="customer-status-is-not-summary-status",
+            private_notes="secret" * 100,
+        )
+
+
+class AnalyticsService:
+    def calculate_summary(self, customer: ProvenanceCustomer) -> Summary:
+        return Summary(status="good")
+
+
+class DerivedDecisionService:
+    def __init__(
+        self,
+        repository: ProvenanceRepository,
+        analytics: AnalyticsService,
+    ) -> None:
+        self.repository = repository
+        self.analytics = analytics
+
+    def is_customer_eligible(self, customer_id: str) -> bool:
+        """Determine whether this customer is eligible from an analytics summary."""
+        customer = self.repository.get_customer(customer_id)
+        summary = self.analytics.calculate_summary(customer)
+        return summary.status == "good"
+
+    def is_customer_directly_eligible(self, customer_id: str) -> bool:
+        """Determine eligibility using an inline analytics summary."""
+        customer = self.repository.get_customer(customer_id)
+        return (
+            customer.status == "active"
+            and self.analytics.calculate_summary(customer).status == "good"
+        )
+
+
+class ProvenanceSafetyTests(unittest.TestCase):
+    def test_derived_call_result_is_not_mapped_to_primary_resource(self) -> None:
+        repository = ProvenanceRepository()
+        service = DerivedDecisionService(repository, AnalyticsService())
+
+        report = DependencyAnalyzer().analyze(
+            service.is_customer_eligible,
+            resource_type=ProvenanceCustomer,
+        )
+
+        self.assertEqual(report.paths, ())
+        self.assertEqual(len(report.unresolved), 1)
+        self.assertIn("calculate_summary", report.unresolved[0])
+        self.assertIn("Summary", report.unresolved[0])
+        self.assertIn("ProvenanceCustomer", report.unresolved[0])
+
+    def test_unresolved_derived_dependency_forces_full_result(self) -> None:
+        repository = ProvenanceRepository()
+        runtime = ContextRuntime()
+        runtime.register(repository)
+        runtime.register(DerivedDecisionService(repository, AnalyticsService()))
+
+        result = runtime.invoke_callable(
+            need="Is this customer eligible from an analytics summary?",
+            callable=repository.get_customer,
+            kwargs={"customer_id": "123"},
+        )
+
+        explanation = result.explain()
+        self.assertFalse(result.projected)
+        self.assertIsInstance(result.content, ProvenanceCustomer)
+        self.assertEqual(result.confidence, 0.0)
+        self.assertEqual(result.evidence, ("UNRESOLVED_DERIVED_DEPENDENCY",))
+        self.assertEqual(
+            explanation["fallback_reason"],
+            "Reference capability depends on a derived or opaque call result",
+        )
+        self.assertIn("calculate_summary", explanation["unresolved_dependencies"][0])
+
+    def test_inline_opaque_call_is_also_unresolved(self) -> None:
+        repository = ProvenanceRepository()
+        service = DerivedDecisionService(repository, AnalyticsService())
+
+        report = DependencyAnalyzer().analyze(
+            service.is_customer_directly_eligible,
+            resource_type=ProvenanceCustomer,
+        )
+
+        self.assertEqual(report.paths, ("status",))
+        self.assertEqual(len(report.unresolved), 1)
+        self.assertIn("calculate_summary", report.unresolved[0])
+
+
+if __name__ == "__main__":
+    unittest.main()

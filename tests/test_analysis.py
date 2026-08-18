@@ -4,6 +4,7 @@ import unittest
 
 from context_runtime.analysis import DependencyAnalyzer
 from examples.saas_app import CustomerRepository, RenewalService
+from examples.saas_app.models import Customer
 
 
 class DependencyAnalyzerTests(unittest.TestCase):
@@ -11,7 +12,8 @@ class DependencyAnalyzerTests(unittest.TestCase):
         service = RenewalService(CustomerRepository())
 
         report = DependencyAnalyzer().analyze(
-            service.should_send_renewal_reminder
+            service.should_send_renewal_reminder,
+            resource_type=Customer,
         )
 
         self.assertEqual(
@@ -32,4 +34,3 @@ class DependencyAnalyzerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
