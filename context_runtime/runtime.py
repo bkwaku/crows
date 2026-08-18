@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from typing import Any, Callable
 
 from .analysis import DependencyAnalyzer
 from .artifacts import InMemoryArtifactStore
 from .confidence import projection_confidence
 from .models import Capability, DependencyReport, InvocationResult, RetrievalMatch
+from .need import ContextVarNeedProvider, NeedProvider, resolve_need
 from .projector import ProjectionError, project
 from .registry import CapabilityRegistry
 from .retrieval import BM25Retriever
@@ -22,6 +24,7 @@ class ContextRuntime:
         *,
         projection_threshold: float = 0.85,
         selection_margin_ratio: float = 1.10,
+        need_provider: NeedProvider | None = None,
     ) -> None:
         self.registry = CapabilityRegistry()
         self.artifacts = InMemoryArtifactStore()
@@ -29,18 +32,36 @@ class ContextRuntime:
         self.analyzer = DependencyAnalyzer()
         self.projection_threshold = projection_threshold
         self.selection_margin_ratio = selection_margin_ratio
+        self.need_provider: NeedProvider = need_provider or ContextVarNeedProvider()
 
     def register(self, target: object, *, include: list[str] | None = None) -> None:
         self.registry.register(target, include=include)
 
-    def invoke(self, *, need: str, kwargs: dict[str, Any]) -> InvocationResult:
+    def need_scope(self, need: str) -> AbstractContextManager[str]:
+        """Bind a need for calls that should not thread need= explicitly.
+
+        Framework adapters can instead supply their own NeedProvider in the
+        constructor. The default ContextVar provider is async/task safe.
+        """
+        scope = getattr(self.need_provider, "scope", None)
+        if not callable(scope):
+            raise TypeError("Configured NeedProvider does not support scoped needs")
+        return scope(need)
+
+    def invoke(
+        self,
+        *,
+        kwargs: dict[str, Any],
+        need: str | None = None,
+    ) -> InvocationResult:
         """Select and execute the registered capability that best satisfies a need."""
+        resolved_need = resolve_need(need, self.need_provider)
         compatible = tuple(
             capability
             for capability in self.registry.all()
             if capability.accepts(kwargs)
         )
-        match = self.retriever.match(need, compatible)
+        match = self.retriever.match(resolved_need, compatible)
         if match is None:
             raise CapabilityNotFound(
                 f"No registered capability matched the need with inputs {sorted(kwargs)}"
@@ -64,7 +85,7 @@ class ContextRuntime:
             evidence=evidence,
             retrieval_score=match.score,
             _explanation={
-                "need": need,
+                "need": resolved_need,
                 "selected_capability": match.capability.qualified_name,
                 "selection_score": round(match.score, 4),
                 "runner_up_score": round(match.runner_up_score, 4),
@@ -77,18 +98,19 @@ class ContextRuntime:
     def invoke_callable(
         self,
         *,
-        need: str,
         callable: Callable[..., Any],
         kwargs: dict[str, Any],
+        need: str | None = None,
     ) -> InvocationResult:
         """Execute an already-selected tool and conservatively project its result."""
+        resolved_need = resolve_need(need, self.need_provider)
         called_capability = (
             self.registry.find_callable(callable) or self.registry.describe(callable)
         )
         raw_result = callable(**kwargs)
 
         reference_match = self._reference_match(
-            need=need,
+            need=resolved_need,
             kwargs=kwargs,
             exclude=called_capability,
         )
@@ -131,7 +153,7 @@ class ContextRuntime:
             projected_result,
         )
         explanation = {
-            "need": need,
+            "need": resolved_need,
             "called_capability": called_capability.qualified_name,
             "reference_capability": (
                 reference_match.capability.qualified_name
