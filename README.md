@@ -69,7 +69,7 @@ Projection is evidence based. The AST analyzer follows field reads in return
 expressions, local aliases, and branch conditions that control returns. Logging
 and unrelated accesses do not enter the slice. Projection only occurs when:
 
-- a compatible business capability matches the need;
+- one compatible business capability matches the need unambiguously;
 - static return dependencies were found;
 - retrieval evidence clears the configured confidence threshold; and
 - every required dependency exists in the actual result.
@@ -118,4 +118,3 @@ dict, dataclass, scalar, or Pydantic-style results. Registration is explicit and
 artifacts are process-local. It does not rewrite database queries, generate SQL,
 use embeddings, crawl arbitrary packages, or provide framework-specific agent
 adapters yet.
-

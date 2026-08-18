@@ -5,7 +5,7 @@ from typing import Any, Callable
 from .analysis import DependencyAnalyzer
 from .artifacts import InMemoryArtifactStore
 from .confidence import projection_confidence
-from .models import Capability, InvocationResult, RetrievalMatch
+from .models import Capability, DependencyReport, InvocationResult, RetrievalMatch
 from .projector import ProjectionError, project
 from .registry import CapabilityRegistry
 from .retrieval import BM25Retriever
@@ -45,10 +45,7 @@ class ContextRuntime:
             raise CapabilityNotFound(
                 f"No registered capability matched the need with inputs {sorted(kwargs)}"
             )
-        if (
-            match.runner_up_score > 0
-            and match.score < match.runner_up_score * self.selection_margin_ratio
-        ):
+        if self._is_ambiguous(match):
             raise CapabilityNotFound(
                 "Capability retrieval was ambiguous; provide a more specific need"
             )
@@ -95,11 +92,15 @@ class ContextRuntime:
             kwargs=kwargs,
             exclude=called_capability,
         )
-        dependencies = (
-            self.analyzer.analyze(reference_match.capability.callable)
-            if reference_match is not None
-            else self.analyzer.analyze(callable)
+        reference_match_is_ambiguous = (
+            reference_match is not None and self._is_ambiguous(reference_match)
         )
+        if reference_match_is_ambiguous:
+            dependencies = DependencyReport(paths=())
+        elif reference_match is not None:
+            dependencies = self.analyzer.analyze(reference_match.capability.callable)
+        else:
+            dependencies = self.analyzer.analyze(callable)
         confidence, evidence = projection_confidence(reference_match, dependencies)
 
         projected_result = raw_result
@@ -110,6 +111,10 @@ class ContextRuntime:
             confidence = 1.0
             evidence = ("DIRECT_SCALAR_RESULT",)
             decision = "scalar_result"
+        elif reference_match_is_ambiguous:
+            confidence = 0.0
+            evidence = ("AMBIGUOUS_REFERENCE_MATCH",)
+            fallback_reason = "Reference capability retrieval was ambiguous"
         elif confidence >= self.projection_threshold:
             try:
                 projected_result = project(raw_result, dependencies.paths)
@@ -132,6 +137,15 @@ class ContextRuntime:
                 reference_match.capability.qualified_name
                 if reference_match is not None
                 else None
+            ),
+            "reference_match_ambiguous": reference_match_is_ambiguous,
+            "reference_score": (
+                round(reference_match.score, 4) if reference_match is not None else 0.0
+            ),
+            "reference_runner_up_score": (
+                round(reference_match.runner_up_score, 4)
+                if reference_match is not None
+                else 0.0
             ),
             "decision": decision,
             "projected": projected,
@@ -169,3 +183,9 @@ class ContextRuntime:
             and capability.accepts(kwargs)
         )
         return self.retriever.match(need, candidates)
+
+    def _is_ambiguous(self, match: RetrievalMatch) -> bool:
+        return (
+            match.runner_up_score > 0
+            and match.score < match.runner_up_score * self.selection_margin_ratio
+        )

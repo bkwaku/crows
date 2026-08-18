@@ -43,6 +43,26 @@ class MissingFieldService:
         return user["entitlements"]["beta"]
 
 
+class FirstFeatureService:
+    def __init__(self, repository: DictRepository) -> None:
+        self.repository = repository
+
+    def can_access_feature(self, user_id: str) -> bool:
+        """Determine whether a user can access a feature."""
+        user = self.repository.fetch_user(user_id)
+        return user["status"] == "active"
+
+
+class SecondFeatureService:
+    def __init__(self, repository: DictRepository) -> None:
+        self.repository = repository
+
+    def can_access_feature(self, user_id: str) -> bool:
+        """Determine whether a user can access a feature."""
+        user = self.repository.fetch_user(user_id)
+        return user["settings"]["enabled"]
+
+
 class ContextRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.repository = CustomerRepository()
@@ -137,6 +157,30 @@ class ContextRuntimeTests(unittest.TestCase):
         self.assertIn("private_notes", result.content)
         self.assertIn("absent", result.explain()["fallback_reason"])
 
+    def test_ambiguous_reference_match_returns_full_result(self) -> None:
+        repository = DictRepository()
+        runtime = ContextRuntime()
+        runtime.register(repository)
+        runtime.register(FirstFeatureService(repository))
+        runtime.register(SecondFeatureService(repository))
+
+        result = runtime.invoke_callable(
+            need="Can this user access a feature?",
+            callable=repository.fetch_user,
+            kwargs={"user_id": "u_1"},
+        )
+
+        explanation = result.explain()
+        self.assertFalse(result.projected)
+        self.assertIn("private_notes", result.content)
+        self.assertEqual(result.confidence, 0.0)
+        self.assertTrue(explanation["reference_match_ambiguous"])
+        self.assertEqual(
+            explanation["fallback_reason"],
+            "Reference capability retrieval was ambiguous",
+        )
+        self.assertEqual(result.evidence, ("AMBIGUOUS_REFERENCE_MATCH",))
+
     def test_no_dependency_evidence_falls_back_to_raw_object(self) -> None:
         runtime = ContextRuntime()
         runtime.register(self.repository)
@@ -161,4 +205,3 @@ class ContextRuntimeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
